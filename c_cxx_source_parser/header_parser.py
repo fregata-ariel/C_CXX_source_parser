@@ -4,6 +4,7 @@ import sqlite3
 import argparse
 import time
 from clang.cindex import Index, Config, CursorKind, TypeKind, TranslationUnit
+import clang.cindex
 
 # --- グローバル変数 ---
 # libclangのライブラリファイルのパス (環境に合わせて変更が必要な場合あり)
@@ -363,8 +364,7 @@ def main():
         # TU_SKIP_FUNCTION_BODIES: 関数の本体をスキップ（ヘッダ解析では不要なことが多い）
         # TU_DETAILED_PREPROCESSING_RECORD: マクロ定義などをより詳細に取得
         parse_options = (
-            TranslationUnit.PARSE_SKIP_FUNCTION_BODIES |
-            TranslationUnit.PARSE_DETAILED_PREPROCESSING_RECORD
+            TranslationUnit.PARSE_SKIP_FUNCTION_BODIES
         )
         tu = index.parse(
             header_filepath,

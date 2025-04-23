@@ -224,15 +224,14 @@ def has_initializer(cursor):
             CursorKind.UNEXPOSED_EXPR, # 初期化式が複雑な場合これになることも
             CursorKind.CALL_EXPR, CursorKind.INIT_LIST_EXPR,
             CursorKind.PAREN_EXPR, CursorKind.UNARY_OPERATOR,
-            CursorKind.BINARY_OPERATOR, CursorKind.COMPOUND_ASSIGN_OPERATOR,
+            CursorKind.BINARY_OPERATOR,
             CursorKind.CONDITIONAL_OPERATOR, CursorKind.CSTYLE_CAST_EXPR,
             CursorKind.CXX_STATIC_CAST_EXPR, CursorKind.CXX_DYNAMIC_CAST_EXPR,
             CursorKind.CXX_REINTERPRET_CAST_EXPR, CursorKind.CXX_CONST_CAST_EXPR,
             CursorKind.CXX_FUNCTIONAL_CAST_EXPR, CursorKind.CXX_NEW_EXPR,
             CursorKind.CXX_DELETE_EXPR, CursorKind.CXX_THIS_EXPR,
             CursorKind.ADDR_LABEL_EXPR, CursorKind.StmtExpr, # GCC拡張
-            CursorKind.COMPOUND_LITERAL_EXPR, # C99複合リテラル
-            CursorKind.DESIGNATED_INIT_EXPR # 指示付き初期化子
+            CursorKind.COMPOUND_LITERAL_EXPR # C99複合リテラル
         ]:
             return 1
     return 0
@@ -454,10 +453,7 @@ def main():
         # 実装ファイルをパース
         # PARSE_SKIP_FUNCTION_BODIES を *削除* して is_definition() の精度を上げる
         # (本体の内容自体はDBに保存しないが、定義かどうかの判定に使う)
-        parse_options = (
-            TranslationUnit.PARSE_DETAILED_PREPROCESSING_RECORD # マクロ取得用
-            # | TranslationUnit.PARSE_INCLUDE_BRIEF_COMMENTS_IN_CODE_COMPLETION # 必要ならコメントも
-        )
+        parse_options = 0
         print("Parsing source file (this may take a moment)...")
         tu = index.parse(
             source_filepath,
