@@ -203,28 +203,28 @@ def get_enum_constants(cursor):
 
 
 def traverse_ast(cursor, db_conn, file_id, target_filepath):
-    """ASTを再帰的に走査し、定義をデータベースに追加する"""
+    """Recursively traverse the AST and add definitions to the database"""
     db_cursor = db_conn.cursor()
 
-    # 現在のカーソルが対象ファイル内にあるか確認 (includeされたヘッダは除外)
-    # CursorKindがUNEXPOSED_DECLなどの場合、locationがNoneになることがある
+    # Check if the current cursor is in the target file (exclude included headers)
+    # Location may be None for CursorKind like UNEXPOSED_DECL
     if cursor.location and cursor.location.file and \
        os.path.abspath(cursor.location.file.name) != target_filepath:
         # print(f"Skipping cursor from other file: {cursor.location.file.name}")
-        return # このカーソルは対象外
+        return # This cursor is not in target file
 
-    # デバッグ用: 現在のカーソルの種類と名前を表示
+    # For debugging: Display current cursor type and name
     # print(f"Visiting: {cursor.kind} - {cursor.spelling} at {cursor.location}")
 
-    # --- 各種定義の処理 ---
+    # --- Process various definitions ---
     if cursor.kind == CursorKind.MACRO_DEFINITION:
-        # libclangは関数形式マクロの本体をうまく取れないことがある
-        # マクロ名のみ取得するか、get_tokensで試みる
+        # libclang may not properly get function-like macro bodies
+        # Either get just the macro name, or try with get_tokens
         name = cursor.spelling
         body = get_macro_body(cursor)
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
         # print(f"  Found Macro: {name} -> {body} at {location}")
-        if name: # 名前がないマクロは無視（例: #define だけ）
+        if name: # Ignore macros without names (e.g., just #define)
             db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
                               (file_id, name, body, location))
 
@@ -233,23 +233,23 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
         return_type = cursor.result_type.spelling
         params = get_function_params(cursor)
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        is_definition = cursor.is_definition() # ヘッダでは通常 false (宣言のみ)
+        is_definition = cursor.is_definition() # Usually false in headers (declarations only)
         # print(f"  Found Function Decl: {return_type} {name}({params}) at {location}")
         db_cursor.execute("INSERT INTO functions (file_id, name, return_type, parameters, is_declaration, location) VALUES (?, ?, ?, ?, ?, ?)",
                           (file_id, name, return_type, params, 0 if is_definition else 1, location))
 
     elif cursor.kind == CursorKind.STRUCT_DECL:
-        name = cursor.spelling or None # 匿名構造体の場合あり
+        name = cursor.spelling or None # May be anonymous struct
         kind = 'struct'
         members = get_struct_union_members(cursor)
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
         # print(f"  Found Struct: {name or '(anonymous)'} {{ {members} }} at {location}")
-        if cursor.is_definition(): # 構造体の定義（中身があるもの）のみ記録
+        if cursor.is_definition(): # Record only struct definitions (with content)
              db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
                                (file_id, kind, name, members, location))
 
     elif cursor.kind == CursorKind.UNION_DECL:
-        name = cursor.spelling or None # 匿名共用体の場合あり
+        name = cursor.spelling or None # May be anonymous union
         kind = 'union'
         members = get_struct_union_members(cursor)
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
@@ -259,7 +259,7 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                               (file_id, kind, name, members, location))
 
     elif cursor.kind == CursorKind.ENUM_DECL:
-        name = cursor.spelling or None # 匿名列挙型の場合あり
+        name = cursor.spelling or None # May be anonymous enum
         constants = get_enum_constants(cursor)
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
         # print(f"  Found Enum: {name or '(anonymous)'} {{ {constants} }} at {location}")
@@ -276,8 +276,8 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                           (file_id, name, underlying_type, location))
 
     elif cursor.kind == CursorKind.VAR_DECL:
-        # ファイルスコープの変数（グローバル変数やstatic変数）のみを対象とする
-        # 関数内のローカル変数は cursor.semantic_parent.kind が FUNCTION_DECL などになる
+        # Only handle file-scope variables (global variables and static variables)
+        # Local variables in functions have cursor.semantic_parent.kind as FUNCTION_DECL
         if cursor.semantic_parent.kind == CursorKind.TRANSLATION_UNIT:
             name = cursor.spelling
             var_type = cursor.type.spelling
@@ -287,7 +287,7 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
             db_cursor.execute("INSERT INTO variables (file_id, name, type, is_extern, location) VALUES (?, ?, ?, ?, ?)",
                               (file_id, name, var_type, 1 if is_extern else 0, location))
 
-    # --- 子ノードを再帰的に探索 ---
+    # --- Recursively explore child nodes ---
     for child in cursor.get_children():
         traverse_ast(child, db_conn, file_id, target_filepath)
 
