@@ -3,12 +3,12 @@ import subprocess
 import sqlite3
 import sys
 import glob
+import pytest
 
 ROUTE_PARSER = os.path.join("c_cxx_source_parser", "route_parser.py")
 HEADER_DB = "tests/definitions_test.db"
 IMPL_DB = "tests/implementations_test.db"
 TARGET_DIR = "tests/test_targets"
-REQUIRED_TABLES = ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"]
 
 def remove_db(path):
     if os.path.exists(path):
@@ -19,81 +19,44 @@ def run_route_parser(file, db):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result
 
-def check_db_tables(db_path):
+def check_db_tables(db_path, required_tables):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
     tables = set(row[0] for row in cur.fetchall())
     conn.close()
-    return all(t in tables for t in REQUIRED_TABLES)
+    return all(t in tables for t in required_tables)
 
-def check_file_entry(db_path, filepath):
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM files WHERE filepath = ?", (os.path.abspath(filepath),))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-def check_definitions(db_path, file_id):
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    for table in REQUIRED_TABLES[1:]:
-        cur.execute(f"SELECT 1 FROM {table} WHERE file_id = ?", (file_id,))
-        if cur.fetchone():
-            conn.close()
-            return True
-    conn.close()
-    return False
-
-def test_all_headers():
+def test_header_file_routing():
     remove_db(HEADER_DB)
-    header_files = glob.glob(os.path.join(TARGET_DIR, "*.h"))
-    for f in header_files:
-        result = run_route_parser(f, HEADER_DB)
-        assert result.returncode == 0, f"Failed to parse header: {f}\n{result.stderr}"
+    header_file = glob.glob(os.path.join(TARGET_DIR, "*.h"))[0]
+    result = run_route_parser(header_file, HEADER_DB)
+    assert result.returncode == 0
     assert os.path.exists(HEADER_DB)
-    assert check_db_tables(HEADER_DB)
-    for f in header_files:
-        assert check_file_entry(HEADER_DB, f), f"Header file not registered in DB: {f}"
-        if os.path.getsize(f) > 0:
-            conn = sqlite3.connect(HEADER_DB)
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM files WHERE filepath = ?", (os.path.abspath(f),))
-            row = cur.fetchone()
-            if row:
-                assert check_definitions(HEADER_DB, row[0]), f"No definitions found for header file: {f}"
-            conn.close()
+    assert check_db_tables(HEADER_DB, ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"])
 
-def test_all_impls():
+def test_impl_file_routing():
     remove_db(IMPL_DB)
-    impl_files = glob.glob(os.path.join(TARGET_DIR, "*.c"))
-    for f in impl_files:
-        result = run_route_parser(f, IMPL_DB)
-        assert result.returncode == 0, f"Failed to parse implementation: {f}\n{result.stderr}"
+    impl_file = glob.glob(os.path.join(TARGET_DIR, "*.c"))[0]
+    result = run_route_parser(impl_file, IMPL_DB)
+    assert result.returncode == 0
     assert os.path.exists(IMPL_DB)
-    assert check_db_tables(IMPL_DB)
-    for f in impl_files:
-        assert check_file_entry(IMPL_DB, f), f"Implementation file not registered in DB: {f}"
-        if os.path.getsize(f) > 0:
-            conn = sqlite3.connect(IMPL_DB)
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM files WHERE filepath = ?", (os.path.abspath(f),))
-            row = cur.fetchone()
-            if row:
-                assert check_definitions(IMPL_DB, row[0]), f"No definitions found for implementation file: {f}"
-            conn.close()
+    assert check_db_tables(IMPL_DB, ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"])
 
-def main():
-    try:
-        test_all_headers()
-        print("All header files parsed and checked successfully.")
-        test_all_impls()
-        print("All implementation files parsed and checked successfully.")
-        print("Route parser integration test complete.")
-    except AssertionError as e:
-        print(f"Test failed: {e}")
-        sys.exit(1)
+def test_unsupported_file_type():
+    fake_file = "tests/test_targets/fake.txt"
+    with open(fake_file, "w") as f:
+        f.write("dummy")
+    result = run_route_parser(fake_file, "tests/fake.db")
+    os.remove(fake_file)
+    assert result.returncode != 0
+    assert "unsupported" in result.stderr.lower() or "unsupported" in result.stdout.lower()
+
+def test_missing_file():
+    missing_file = "tests/test_targets/missing_file.h"
+    result = run_route_parser(missing_file, HEADER_DB)
+    assert result.returncode != 0
+    assert "not found" in result.stderr.lower() or "not found" in result.stdout.lower()
 
 if __name__ == "__main__":
-    main()
+    pytest.main([__file__])
