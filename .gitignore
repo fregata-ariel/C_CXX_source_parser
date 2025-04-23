@@ -51,6 +51,7 @@ coverage.xml
 .pytest_cache/
 cover/
 tests/test_targets/*
+tests/*.db
 
 # Translations
 *.mo

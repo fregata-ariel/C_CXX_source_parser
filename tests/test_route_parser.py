@@ -29,19 +29,35 @@ def check_db_tables(db_path, required_tables):
 
 def test_header_file_routing():
     remove_db(HEADER_DB)
-    header_file = glob.glob(os.path.join(TARGET_DIR, "*.h"))[0]
-    result = run_route_parser(header_file, HEADER_DB)
+    header_files = glob.glob(os.path.join(TARGET_DIR, "*.h"))[0]
+    result = run_route_parser(header_files, HEADER_DB)
     assert result.returncode == 0
     assert os.path.exists(HEADER_DB)
     assert check_db_tables(HEADER_DB, ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"])
 
 def test_impl_file_routing():
     remove_db(IMPL_DB)
-    impl_file = glob.glob(os.path.join(TARGET_DIR, "*.c"))[0]
-    result = run_route_parser(impl_file, IMPL_DB)
+    impl_files = glob.glob(os.path.join(TARGET_DIR, "*.c"))[0]
+    result = run_route_parser(impl_files, IMPL_DB)
     assert result.returncode == 0
     assert os.path.exists(IMPL_DB)
     assert check_db_tables(IMPL_DB, ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"])
+
+def test_file_routing():
+    remove_db(HEADER_DB)
+    remove_db(IMPL_DB)
+    source_files = glob.glob(os.path.join(TARGET_DIR, "*.*"))
+    for f in source_files:
+        if f.endswith(".h"):
+            db_path = HEADER_DB
+        elif f.endswith(".c"):
+            db_path = IMPL_DB
+        else:
+            continue
+        result = run_route_parser(f, db_path)
+        assert result.returncode == 0
+        assert os.path.exists(db_path)
+        assert check_db_tables(db_path, ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"])
 
 def test_unsupported_file_type():
     fake_file = "tests/test_targets/fake.txt"
