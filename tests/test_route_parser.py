@@ -54,7 +54,7 @@ def test_file_routing():
             db_path = IMPL_DB
         else:
             continue
-        result = run_route_parser(ROUTE_PARSER, f, db_path)
+        result = run_route_parser(f, db_path)
         assert result.returncode == 0
         assert os.path.exists(db_path)
         assert check_db_tables(db_path, ["files", "macros", "functions", "structs_unions", "enums", "typedefs", "variables"])
