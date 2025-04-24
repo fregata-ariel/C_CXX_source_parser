@@ -237,45 +237,45 @@ def has_initializer(cursor):
     return 0
 
 
-# --- Clang AST 解析 (実装ファイル向けに更新) ---
+# --- Clang AST Analysis (updated for implementation files) ---
 
 def traverse_ast(cursor, db_conn, file_id, target_filepath):
-    """ASTを再帰的に走査し、定義をデータベースに追加する"""
+    """Recursively traverse the AST and add definitions to the database"""
     db_cursor = db_conn.cursor()
 
-    # 対象ファイル内のカーソルか、関連するヘッダのカーソルかを判定
+    # Determine if the cursor is in the target file or a related header
     in_target_file = False
     if cursor.location and cursor.location.file:
         try:
             in_target_file = os.path.abspath(cursor.location.file.name) == target_filepath
         except FileNotFoundError:
-            # 一時ファイルなどでエラーになる場合がある
-             pass
+            # Can error out for temporary files, etc.
+            pass
     
-    # スコープの取得 (ファイルスコープか、クラス/構造体スコープかなど)
+    # Get scope (file scope, class/struct scope, etc.)
     parent_kind = None
     parent_name = None
     is_file_scope = False
-    is_class_scope = False # C++用
+    is_class_scope = False # For C++
 
     try:
         semantic_parent = cursor.semantic_parent
         if semantic_parent:
             parent_kind_enum = semantic_parent.kind
-            parent_kind = parent_kind_enum.name # 文字列として保持
+            parent_kind = parent_kind_enum.name # Store as string
             is_file_scope = parent_kind_enum == CursorKind.TRANSLATION_UNIT
             is_class_scope = parent_kind_enum in [CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL, CursorKind.NAMESPACE] # C++
             if is_class_scope and semantic_parent.spelling:
                  parent_name = semantic_parent.spelling
     except Exception as e:
         # print(f"Debug: Could not get semantic parent for {cursor.kind} {cursor.spelling}: {e}", file=sys.stderr)
-        pass # 親が取れない場合もある
+        pass # Sometimes parent can't be retrieved
 
 
-    # --- 定義の処理 (ファイルスコープ or クラススコープを中心に) ---
+    # --- Handle definitions (mainly file scope or class scope) ---
 
-    # マクロ (ファイル内で定義されたもの)
-    # cursor.location がないとファイル判定できないのでチェック
+    # Macro (defined in the file)
+    # Check cursor.location to determine file
     if cursor.kind == CursorKind.MACRO_DEFINITION and in_target_file:
         name = cursor.spelling
         body = get_macro_body(cursor)
@@ -284,27 +284,27 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
             db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
                               (file_id, name, body, location))
 
-    # 関数 (ファイルスコープ or クラススコープ)
+    # Function (file scope or class scope)
     elif cursor.kind == CursorKind.FUNCTION_DECL and (is_file_scope or is_class_scope):
-         # .cppファイル等では、ヘッダで宣言され .cpp で定義される場合、両方のファイルで現れる。
-         # in_target_file で現在のファイルでの定義/宣言に絞る。
+         # In .cpp files, functions may be declared in headers and defined in .cpp files, appearing in both.
+         # Use in_target_file to focus on definitions/declarations in the current file.
         if in_target_file:
             name = cursor.spelling
-            if not name: # 無名関数などはスキップ
+            if not name: # Skip unnamed functions
                 return
 
             return_type = cursor.result_type.spelling
             params = get_function_params(cursor)
             location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            is_definition = cursor.is_definition() # 本体があるか (定義か)
+            is_definition = cursor.is_definition() # Has body (is a definition)
             storage_class = cursor.storage_class
             is_static = storage_class == StorageClass.STATIC
 
-            # C++のコンストラクタ/デストラクタ等は戻り値型がない場合がある
+            # C++ constructors/destructors may not have a return type
             if not return_type and parent_kind in ['CLASS_DECL', 'STRUCT_DECL']:
-                 if name == parent_name: # コンストラクタ
+                 if name == parent_name: # Constructor
                      return_type = "(constructor)"
-                 elif name == f"~{parent_name}": # デストラクタ
+                 elif name == f"~{parent_name}": # Destructor
                      return_type = "(destructor)"
 
             # print(f" Found Function: {name} (static={is_static}, def={is_definition}) in {parent_kind}:{parent_name} at {location}")
@@ -313,11 +313,11 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                 (file_id, name, return_type, params, 0 if is_definition else 1, 1 if is_static else 0, parent_kind if is_class_scope else None, parent_name if is_class_scope else None, location)
             )
 
-    # グローバル変数 / ファイル静的変数 (ファイルスコープのみ)
+    # Global variables / file static variables (file scope only)
     elif cursor.kind == CursorKind.VAR_DECL and is_file_scope:
         if in_target_file:
             name = cursor.spelling
-            if not name: # 無名変数はスキップ
+            if not name: # Skip unnamed variables
                 return
 
             var_type = cursor.type.spelling
@@ -333,9 +333,9 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                 (file_id, name, var_type, 1 if is_extern else 0, 1 if is_static else 0, init, location)
             )
 
-    # 構造体/共用体 (ファイルスコープ) - ヘッダでの定義が多いが、.c/.cpp 内定義も考慮
+    # Structs/unions (file scope) - usually defined in headers, but also possible in .c/.cpp files
     elif cursor.kind == CursorKind.STRUCT_DECL and is_file_scope:
-        if in_target_file and cursor.is_definition(): # 定義のみ記録
+        if in_target_file and cursor.is_definition(): # Record only definitions
             name = cursor.spelling or None
             kind = 'struct'
             members = get_struct_union_members(cursor)
@@ -352,7 +352,7 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
             db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
                               (file_id, kind, name, members, location))
 
-    # 列挙型 (ファイルスコープ)
+    # Enums (file scope)
     elif cursor.kind == CursorKind.ENUM_DECL and is_file_scope:
         if in_target_file and cursor.is_definition():
             name = cursor.spelling or None
@@ -361,24 +361,24 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
             db_cursor.execute("INSERT INTO enums (file_id, name, constants, location) VALUES (?, ?, ?, ?)",
                               (file_id, name, constants, location))
 
-    # Typedef (ファイルスコープ)
+    # Typedefs (file scope)
     elif cursor.kind == CursorKind.TYPEDEF_DECL and is_file_scope:
         if in_target_file:
             name = cursor.spelling
             try:
                  underlying_type = cursor.underlying_typedef_type.spelling
             except Exception:
-                 underlying_type = "unknown" # underlying typeが取得できないケースへの対処
+                 underlying_type = "unknown" # Handle cases where underlying type can't be retrieved
             location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
             db_cursor.execute("INSERT INTO typedefs (file_id, name, underlying_type, location) VALUES (?, ?, ?, ?)",
                               (file_id, name, underlying_type, location))
 
 
-    # --- 子ノードを再帰的に探索 ---
-    # 関数やクラスの「中」は基本的に追わない設定 (ファイル/クラススコープの定義が主目的のため)
-    # ただし、Namespace など、さらに掘り下げるべきケースもある。
-    # ここでは、すべてのトップレベルの子ノードを辿るシンプルな実装とする。
-    # (関数の中のローカル変数などは、上記の is_file_scope/is_class_scope チェックで除外される想定)
+    # --- Recursively traverse child nodes ---
+    # By default, do not traverse inside functions or classes (focus on file/class scope definitions)
+    # However, for namespaces and similar, further traversal may be needed.
+    # Here, we simply traverse all top-level child nodes.
+    # (Local variables inside functions, etc., are excluded by the is_file_scope/is_class_scope checks above)
     for child in cursor.get_children():
         traverse_ast(child, db_conn, file_id, target_filepath)
 

@@ -3,7 +3,7 @@ import os
 import sqlite3
 import argparse
 import time
-from clang.cindex import Index, Config, CursorKind, TypeKind, TranslationUnit
+from clang.cindex import Index, Config, CursorKind, TypeKind, TranslationUnit, StorageClass
 import clang.cindex
 
 # --- グローバル変数 ---
