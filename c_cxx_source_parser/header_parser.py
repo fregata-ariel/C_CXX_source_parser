@@ -156,7 +156,7 @@ def add_file_record(conn, filepath):
 
 # --- Clang AST 解析 ---
 
-def get_macro_body(cursor):
+def get_macro_body(cursor:clang.cindex.Cursor):
     """マクロの本体を取得する試み"""
     tokens = list(cursor.get_tokens())
     if len(tokens) > 1:
@@ -172,7 +172,7 @@ def get_macro_body(cursor):
         return body.strip()
     return None # 本体がないか、取得失敗
 
-def get_function_params(cursor):
+def get_function_params(cursor:clang.cindex.Cursor):
     """関数のパラメータリストを文字列として取得する"""
     params = []
     for arg in cursor.get_arguments():
@@ -181,7 +181,7 @@ def get_function_params(cursor):
         params.append(f"{param_type} {param_name}".strip())
     return ", ".join(params)
 
-def get_struct_union_members(cursor):
+def get_struct_union_members(cursor:clang.cindex.Cursor):
     """構造体/共用体のメンバを文字列として取得する"""
     members = []
     for child in cursor.get_children():
@@ -190,7 +190,7 @@ def get_struct_union_members(cursor):
         # ネストされた構造体/共用体/enumなどの扱いはここでは省略
     return " ".join(members)
 
-def get_enum_constants(cursor):
+def get_enum_constants(cursor:clang.cindex.Cursor):
     """列挙型の定数を文字列として取得する"""
     constants = []
     for child in cursor.get_children():
@@ -202,21 +202,28 @@ def get_enum_constants(cursor):
     return ", ".join(constants)
 
 
-def traverse_ast(cursor, db_conn, file_id, target_filepath):
+def traverse_ast(
+        cursor:clang.cindex.Cursor,
+        db_conn:sqlite3.Connection,
+        file_id:int,
+        target_filepath:str
+        ) -> None:
     """Recursively traverse the AST and add definitions to the database"""
     db_cursor = db_conn.cursor()
 
-    # Check if the cursor is in the target file
-    # (location may be None for CursorKind like UNEXPOSED_DECL)
+    # Check if the cursor is in the target file (exclude included headers)
+    # Location may be None for CursorKind like UNEXPOSED_DECL
     if cursor.location and cursor.location.file and \
        os.path.abspath(cursor.location.file.name) != target_filepath:
-        return
+        return # This cursor is not in target file
     # Debugging: Display current cursor type and name
-    print(f"Visiting: {cursor.kind} - {cursor.spelling} at {cursor.location}")
+    # print(f"Visiting: {cursor.kind} - {cursor.spelling} at {cursor.location}")
 
     # --- Process various definitions ---
 
     if cursor.kind == CursorKind.MACRO_DEFINITION:
+        # libclang may not properly get function-like macro bodies
+        # Either get just the macro name, or try with get_tokens
         name = cursor.spelling or None
         body = get_macro_body(cursor) or ""
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
@@ -228,31 +235,32 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
             # Update the existing record
             db_cursor.execute("UPDATE macros SET body=?, location=? WHERE id=?", (body, location, existing_macro[0]))
         else:
-            # Insert new macro
-            db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
-                              (file_id, name, body, location))
+            if name: # Ignore macros without names (e.g., just #define)
+                db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
+                                (file_id, name, body, location))
 
     elif cursor.kind == CursorKind.FUNCTION_DECL:
-        name = cursor.spelling or None
+        name = cursor.spelling or None  # May be anonymous struct
         return_type = cursor.result_type.spelling or ""
         params = get_function_params(cursor) or ""
         is_declaration = 1 if not cursor.is_definition() else 0
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
 
         # Check for existing function
-        db_cursor.execute("SELECT id FROM functions WHERE file_id = ? AND name = ?", (file_id, name))
-        existing_func = db_cursor.fetchone()
-        if existing_func:
-            # Update the function record
-            db_cursor.execute("UPDATE functions SET return_type=?, parameters=?, is_declaration=?, location=? WHERE id=?",
-                              (return_type, params, is_declaration, location, existing_func[0]))
-        else:
-            # Insert new function
-            db_cursor.execute("INSERT INTO functions (file_id, name, return_type, parameters, is_declaration, location) VALUES (?, ?, ?, ?, ?, ?)",
-                              (file_id, name, return_type, params, is_declaration, location))
+        if cursor.is_definition(): # Record only struct definitions (with content)
+            db_cursor.execute("SELECT id FROM functions WHERE file_id = ? AND name = ?", (file_id, name))
+            existing_func = db_cursor.fetchone()
+            if existing_func:
+                # Update the function record
+                db_cursor.execute("UPDATE functions SET return_type=?, parameters=?, is_declaration=?, location=? WHERE id=?",
+                                (return_type, params, is_declaration, location, existing_func[0]))
+            else:
+                # Insert new function
+                db_cursor.execute("INSERT INTO functions (file_id, name, return_type, parameters, is_declaration, location) VALUES (?, ?, ?, ?, ?, ?)",
+                                (file_id, name, return_type, params, is_declaration, location))
 
     elif cursor.kind == CursorKind.STRUCT_DECL:
-        name = cursor.spelling or None
+        name = cursor.spelling or None # May be anonymous struct
         kind = 'struct'
         members = get_struct_union_members(cursor) or ""
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
@@ -273,7 +281,7 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                                   (file_id, kind, name, members, location))
 
     elif cursor.kind == CursorKind.UNION_DECL:
-        name = cursor.spelling or None
+        name = cursor.spelling or None # May be anonymous union
         kind = 'union'
         members = get_struct_union_members(cursor) or ""
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
@@ -294,7 +302,7 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                                   (file_id, name, kind, members, location))
 
     elif cursor.kind == CursorKind.ENUM_DECL:
-        name = cursor.spelling or None
+        name = cursor.spelling or None # May be anonymous enum
         constants = get_enum_constants(cursor) or ""
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
 
@@ -330,7 +338,8 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                               (file_id, name, underlying_type, location))
 
     elif cursor.kind == CursorKind.VAR_DECL:
-        # Only handle file-scope variables
+        # Only handle file-scope variables (global variables and static variables)
+        # Local variables in functions have cursor.semantic_parent.kind as FUNCTION_DECL
         if cursor.semantic_parent.kind == CursorKind.TRANSLATION_UNIT:
             name = cursor.spelling or None
             var_type = cursor.type.spelling or ""
@@ -349,6 +358,7 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
                 db_cursor.execute("INSERT INTO variables (file_id, name, type, is_extern, location) VALUES (?, ?, ?, ?, ?)",
                                   (file_id, name, var_type, is_extern, location))
 
+    # --- Recursively explore child nodes ---
     for child in cursor.get_children():
         traverse_ast(child, db_conn, file_id, target_filepath)
 
