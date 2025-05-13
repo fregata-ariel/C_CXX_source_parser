@@ -3,7 +3,7 @@ import os
 import sqlite3
 import argparse
 import time
-from clang.cindex import Index, Config, CursorKind, TypeKind, TranslationUnit
+from clang.cindex import Index, Config, CursorKind, TypeKind, TranslationUnit, StorageClass
 import clang.cindex
 
 # --- グローバル変数 ---
@@ -156,7 +156,7 @@ def add_file_record(conn, filepath):
 
 # --- Clang AST 解析 ---
 
-def get_macro_body(cursor):
+def get_macro_body(cursor:clang.cindex.Cursor):
     """マクロの本体を取得する試み"""
     tokens = list(cursor.get_tokens())
     if len(tokens) > 1:
@@ -172,7 +172,7 @@ def get_macro_body(cursor):
         return body.strip()
     return None # 本体がないか、取得失敗
 
-def get_function_params(cursor):
+def get_function_params(cursor:clang.cindex.Cursor):
     """関数のパラメータリストを文字列として取得する"""
     params = []
     for arg in cursor.get_arguments():
@@ -181,7 +181,7 @@ def get_function_params(cursor):
         params.append(f"{param_type} {param_name}".strip())
     return ", ".join(params)
 
-def get_struct_union_members(cursor):
+def get_struct_union_members(cursor:clang.cindex.Cursor):
     """構造体/共用体のメンバを文字列として取得する"""
     members = []
     for child in cursor.get_children():
@@ -190,7 +190,7 @@ def get_struct_union_members(cursor):
         # ネストされた構造体/共用体/enumなどの扱いはここでは省略
     return " ".join(members)
 
-def get_enum_constants(cursor):
+def get_enum_constants(cursor:clang.cindex.Cursor):
     """列挙型の定数を文字列として取得する"""
     constants = []
     for child in cursor.get_children():
@@ -202,92 +202,163 @@ def get_enum_constants(cursor):
     return ", ".join(constants)
 
 
-def traverse_ast(cursor, db_conn, file_id, target_filepath):
-    """ASTを再帰的に走査し、定義をデータベースに追加する"""
+def traverse_ast(
+        cursor:clang.cindex.Cursor,
+        db_conn:sqlite3.Connection,
+        file_id:int,
+        target_filepath:str
+        ) -> None:
+    """Recursively traverse the AST and add definitions to the database"""
     db_cursor = db_conn.cursor()
 
-    # 現在のカーソルが対象ファイル内にあるか確認 (includeされたヘッダは除外)
-    # CursorKindがUNEXPOSED_DECLなどの場合、locationがNoneになることがある
+    # Check if the cursor is in the target file (exclude included headers)
+    # Location may be None for CursorKind like UNEXPOSED_DECL
     if cursor.location and cursor.location.file and \
        os.path.abspath(cursor.location.file.name) != target_filepath:
-        # print(f"Skipping cursor from other file: {cursor.location.file.name}")
-        return # このカーソルは対象外
-
-    # デバッグ用: 現在のカーソルの種類と名前を表示
+        return # This cursor is not in target file
+    # Debugging: Display current cursor type and name
     # print(f"Visiting: {cursor.kind} - {cursor.spelling} at {cursor.location}")
 
-    # --- 各種定義の処理 ---
+    # --- Process various definitions ---
+
     if cursor.kind == CursorKind.MACRO_DEFINITION:
-        # libclangは関数形式マクロの本体をうまく取れないことがある
-        # マクロ名のみ取得するか、get_tokensで試みる
-        name = cursor.spelling
-        body = get_macro_body(cursor)
-        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        # print(f"  Found Macro: {name} -> {body} at {location}")
-        if name: # 名前がないマクロは無視（例: #define だけ）
-            db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
-                              (file_id, name, body, location))
+        # libclang may not properly get function-like macro bodies
+        # Either get just the macro name, or try with get_tokens
+        name = cursor.spelling or None
+        body = get_macro_body(cursor) or ""
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+
+        # Check if this macro already exists for the file_id and name
+        db_cursor.execute("SELECT id FROM macros WHERE file_id = ? AND name = ?", (file_id, name))
+        existing_macro = db_cursor.fetchone()
+        if existing_macro:
+            # Update the existing record
+            db_cursor.execute("UPDATE macros SET body=?, location=? WHERE id=?", (body, location, existing_macro[0]))
+        else:
+            if name: # Ignore macros without names (e.g., just #define)
+                db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
+                                (file_id, name, body, location))
 
     elif cursor.kind == CursorKind.FUNCTION_DECL:
-        name = cursor.spelling
-        return_type = cursor.result_type.spelling
-        params = get_function_params(cursor)
-        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        is_definition = cursor.is_definition() # ヘッダでは通常 false (宣言のみ)
-        # print(f"  Found Function Decl: {return_type} {name}({params}) at {location}")
-        db_cursor.execute("INSERT INTO functions (file_id, name, return_type, parameters, is_declaration, location) VALUES (?, ?, ?, ?, ?, ?)",
-                          (file_id, name, return_type, params, 0 if is_definition else 1, location))
+        name = cursor.spelling or None  # May be anonymous struct
+        return_type = cursor.result_type.spelling or ""
+        params = get_function_params(cursor) or ""
+        is_declaration = 1 if not cursor.is_definition() else 0
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+
+        # Check for existing function
+        if cursor.is_definition(): # Record only struct definitions (with content)
+            db_cursor.execute("SELECT id FROM functions WHERE file_id = ? AND name = ?", (file_id, name))
+            existing_func = db_cursor.fetchone()
+            if existing_func:
+                # Update the function record
+                db_cursor.execute("UPDATE functions SET return_type=?, parameters=?, is_declaration=?, location=? WHERE id=?",
+                                (return_type, params, is_declaration, location, existing_func[0]))
+            else:
+                # Insert new function
+                db_cursor.execute("INSERT INTO functions (file_id, name, return_type, parameters, is_declaration, location) VALUES (?, ?, ?, ?, ?, ?)",
+                                (file_id, name, return_type, params, is_declaration, location))
 
     elif cursor.kind == CursorKind.STRUCT_DECL:
-        name = cursor.spelling or None # 匿名構造体の場合あり
+        name = cursor.spelling or None # May be anonymous struct
         kind = 'struct'
-        members = get_struct_union_members(cursor)
-        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        # print(f"  Found Struct: {name or '(anonymous)'} {{ {members} }} at {location}")
-        if cursor.is_definition(): # 構造体の定義（中身があるもの）のみ記録
-             db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
-                               (file_id, kind, name, members, location))
+        members = get_struct_union_members(cursor) or ""
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+
+        # Ensure it's a definition (not just declaration)
+        if cursor.is_definition():
+            # Check for existing struct
+            db_cursor.execute("SELECT id FROM structs_unions WHERE file_id = ? AND name = ? AND kind = ?",
+                              (file_id, name, kind))
+            existing_struct = db_cursor.fetchone()
+            if existing_struct:
+                # Update the struct record
+                db_cursor.execute("UPDATE structs_unions SET members=?, location=? WHERE id=?",
+                                  (members, location, existing_struct[0]))
+            else:
+                # Insert new struct
+                db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
+                                  (file_id, kind, name, members, location))
 
     elif cursor.kind == CursorKind.UNION_DECL:
-        name = cursor.spelling or None # 匿名共用体の場合あり
+        name = cursor.spelling or None # May be anonymous union
         kind = 'union'
-        members = get_struct_union_members(cursor)
-        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        # print(f"  Found Union: {name or '(anonymous)'} {{ {members} }} at {location}")
+        members = get_struct_union_members(cursor) or ""
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+
+        # Ensure it's a definition (not just declaration)
         if cursor.is_definition():
-            db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
-                              (file_id, kind, name, members, location))
+            # Check for existing union
+            db_cursor.execute("SELECT id FROM structs_unions WHERE file_id = ? AND name = ? AND kind = ?",
+                              (file_id, name, kind))
+            existing_union = db_cursor.fetchone()
+            if existing_union:
+                # Update the union record
+                db_cursor.execute("UPDATE structs_unions SET members=?, location=? WHERE id=?",
+                                  (members, location, existing_union[0]))
+            else:
+                # Insert new union
+                db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
+                                  (file_id, name, kind, members, location))
 
     elif cursor.kind == CursorKind.ENUM_DECL:
-        name = cursor.spelling or None # 匿名列挙型の場合あり
-        constants = get_enum_constants(cursor)
-        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        # print(f"  Found Enum: {name or '(anonymous)'} {{ {constants} }} at {location}")
+        name = cursor.spelling or None # May be anonymous enum
+        constants = get_enum_constants(cursor) or ""
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+
+        # Ensure it's a definition (not just declaration)
         if cursor.is_definition():
-             db_cursor.execute("INSERT INTO enums (file_id, name, constants, location) VALUES (?, ?, ?, ?)",
-                               (file_id, name, constants, location))
+            # Check for existing enum
+            db_cursor.execute("SELECT id FROM enums WHERE file_id = ? AND name = ?", (file_id, name))
+            existing_enum = db_cursor.fetchone()
+            if existing_enum:
+                # Update the enum record
+                db_cursor.execute("UPDATE enums SET constants=?, location=? WHERE id=?",
+                                  (constants, location, existing_enum[0]))
+            else:
+                # Insert new enum
+                db_cursor.execute("INSERT INTO enums (file_id, name, constants, location) VALUES (?, ?, ?, ?)",
+                                  (file_id, name, constants, location))
 
     elif cursor.kind == CursorKind.TYPEDEF_DECL:
-        name = cursor.spelling
-        underlying_type = cursor.underlying_typedef_type.spelling
-        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-        # print(f"  Found Typedef: {name} -> {underlying_type} at {location}")
-        db_cursor.execute("INSERT INTO typedefs (file_id, name, underlying_type, location) VALUES (?, ?, ?, ?)",
-                          (file_id, name, underlying_type, location))
+        name = cursor.spelling or None
+        underlying_type = cursor.underlying_typedef_type.spelling or ""
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+
+        # Check for existing typedef
+        db_cursor.execute("SELECT id FROM typedefs WHERE file_id = ? AND name = ?", (file_id, name))
+        existing_TYPEDEF = db_cursor.fetchone()
+        if existing_TYPEDEF:
+            # Update the typedef record
+            db_cursor.execute("UPDATE typedefs SET underlying_type=?, location=? WHERE id=?",
+                              (underlying_type, location, existing_TYPEDEF[0]))
+        else:
+            # Insert new typedef
+            db_cursor.execute("INSERT INTO typedefs (file_id, name, underlying_type, location) VALUES (?, ?, ?, ?)",
+                              (file_id, name, underlying_type, location))
 
     elif cursor.kind == CursorKind.VAR_DECL:
-        # ファイルスコープの変数（グローバル変数やstatic変数）のみを対象とする
-        # 関数内のローカル変数は cursor.semantic_parent.kind が FUNCTION_DECL などになる
+        # Only handle file-scope variables (global variables and static variables)
+        # Local variables in functions have cursor.semantic_parent.kind as FUNCTION_DECL
         if cursor.semantic_parent.kind == CursorKind.TRANSLATION_UNIT:
-            name = cursor.spelling
-            var_type = cursor.type.spelling
-            is_extern = cursor.storage_class == clang.cindex.StorageClass.EXTERN
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            # print(f"  Found Global Var: {'extern ' if is_extern else ''}{var_type} {name} at {location}")
-            db_cursor.execute("INSERT INTO variables (file_id, name, type, is_extern, location) VALUES (?, ?, ?, ?, ?)",
-                              (file_id, name, var_type, 1 if is_extern else 0, location))
+            name = cursor.spelling or None
+            var_type = cursor.type.spelling or ""
+            is_extern = 1 if cursor.storage_class == StorageClass.EXTERN else 0
+            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
 
-    # --- 子ノードを再帰的に探索 ---
+            # Check for existing variable
+            db_cursor.execute("SELECT id FROM variables WHERE file_id = ? AND name = ?", (file_id, name))
+            existing_var = db_cursor.fetchone()
+            if existing_var:
+                # Update the variable record
+                db_cursor.execute("UPDATE variables SET type=?, is_extern=?, location=? WHERE id=?",
+                                  (var_type, is_extern, location, existing_var[0]))
+            else:
+                # Insert new variable
+                db_cursor.execute("INSERT INTO variables (file_id, name, type, is_extern, location) VALUES (?, ?, ?, ?, ?)",
+                                  (file_id, name, var_type, is_extern, location))
+
+    # --- Recursively explore child nodes ---
     for child in cursor.get_children():
         traverse_ast(child, db_conn, file_id, target_filepath)
 
