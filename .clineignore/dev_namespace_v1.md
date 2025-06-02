@@ -722,3 +722,267 @@ def main():
 この計画書に基づき、必要なヘルパー関数を定義し、`traverse_ast` および `main` 関数を修正することで、名前空間のスコープ追跡機能が実装できるはずです。特に `impl_parser.py` におけるクラスメンバーと名前空間の二重のスコープ管理には注意が必要です。クラス定義自体も名前空間に属するため、クラスを処理する際にその `namespace_id` を決定し、メンバー関数はそのクラスの `parent_name` と、クラスが属する `namespace_id` を持つことになります。
 
 ---
+
+> me
+
+ありがとうございます．ではこのプランの最後であるステップ４に関しても同様に，実装手前までの詳細な設計をしてください． ありがとうございます．ではこのプランの最後であるステップ４に関しても同様に，実装手前までの詳細な設計をしてください． 
+
+---
+
+> gemini 2.5 pro preview
+
+はい、承知いたしました。「Step 4: 実装とテスト」について、実装手前までの具体的な計画書をステップバイステップで記述します。
+
+---
+
+## 実装とテスト計画書 (Step 4 詳細)
+
+### 1. `setup_database` 関数の更新詳細
+
+**1.1. 対象ファイル**
+* `c_cxx_source_parser/header_parser.py`
+* `c_cxx_source_parser/impl_parser.py`
+
+**1.2. 変更内容**
+両ファイル内の `setup_database(conn)` 関数に以下の変更を加えます。
+
+* **1.2.1. `files` テーブルへのグローバルコンテキスト用レコード挿入:**
+    * Step 2 (2.4) で計画した通り、`(global_context)` というファイルパスを持つレコードを `files` テーブルに挿入します。これは、`namespaces` テーブルの `(global)` レコードの `file_id` として使用されます。`INSERT OR IGNORE` を使用するか、事前にSELECTして存在確認後にINSERTします。
+    ```python
+    # In setup_database(conn)
+    cursor = conn.cursor()
+    global_context_filepath = '(global_context)'
+    cursor.execute("INSERT OR IGNORE INTO files (filepath) VALUES (?)", (global_context_filepath,))
+    # last_parsed_at は DEFAULT CURRENT_TIMESTAMP が設定されているはずなので、指定不要
+    
+    cursor.execute("SELECT id FROM files WHERE filepath = ?", (global_context_filepath,))
+    global_file_id_record = cursor.fetchone()
+    if not global_file_id_record:
+        # INSERT OR IGNORE が機能していればここには来ないはずだが、念のためエラーハンドリング
+        raise Exception("Failed to insert or find global_context file record.")
+    global_file_id_for_global_ns = global_file_id_record[0]
+    ```
+
+* **1.2.2. `namespaces` テーブルの作成:**
+    * Step 2 (2.1) で定義した `CREATE TABLE IF NOT EXISTS namespaces (...)` SQL文を実行します。
+    ```python
+    # (続き)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS namespaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_namespace_id INTEGER,
+            file_id INTEGER NOT NULL, -- このFQNが最初に見つかったfiles.id
+            location TEXT NOT NULL,
+            full_qualified_name TEXT NOT NULL UNIQUE,
+            FOREIGN KEY (parent_namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+        )
+    ''')
+    # インデックス作成 (Step 2 (2.3) 参照)
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_name ON namespaces (name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_parent_id ON namespaces (parent_namespace_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_file_id ON namespaces (file_id)')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_namespaces_fqn ON namespaces (full_qualified_name)')
+    ```
+
+* **1.2.3. グローバル名前空間レコードの初期挿入:**
+    * Step 2 (2.4) で計画した通り、`(global)` 名前空間レコードを `namespaces` テーブルに挿入します。`file_id` には上記で取得した `global_file_id_for_global_ns` を使用します。
+    ```python
+    # (続き)
+    global_namespace_name = "(global)"
+    global_namespace_fqn = "(global)"
+    cursor.execute("""
+        INSERT OR IGNORE INTO namespaces (name, parent_namespace_id, file_id, location, full_qualified_name)
+        VALUES (?, NULL, ?, ?, ?)
+    """, (global_namespace_name, global_file_id_for_global_ns, "N/A", global_namespace_fqn))
+    ```
+
+* **1.2.4. 既存テーブルの `CREATE TABLE` 文の修正:**
+    * `functions`, `variables`, `structs_unions`, `enums`, `typedefs` の各テーブルの `CREATE TABLE IF NOT EXISTS ...` 文を修正し、`namespace_id INTEGER NOT NULL` カラムと `FOREIGN KEY (namespace_id) REFERENCES namespaces(id) ON DELETE CASCADE` 制約を追加します (Step 2 (3.3) 参照)。
+    * 例 (`functions` テーブル):
+    ```python
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS functions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL, -- 追加
+            name TEXT NOT NULL,
+            return_type TEXT,
+            parameters TEXT,
+            is_declaration INTEGER DEFAULT {1 if parser_type == 'header' else 'NULL'}, -- パーサータイプでデフォルト値を調整
+            {'is_static INTEGER DEFAULT 0,' if parser_type == 'impl' else ''}
+            {'parent_kind TEXT,' if parser_type == 'impl' else ''}
+            {'parent_name TEXT,' if parser_type == 'impl' else ''}
+            location TEXT,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE -- 追加
+        )
+    ''') # parser_type は 'header' または 'impl' を示す変数を渡すか、各ファイルで直接記述
+    ```
+    * 各パーサーで `is_declaration` のデフォルト値や `impl_parser` のみ存在するカラム (`is_static` など) の扱いが異なるため、それぞれのファイルで適切に `CREATE TABLE` 文を調整する必要があります。`namespace_id` の追加は共通です。
+
+* **1.2.5. コミット:**
+    全てのスキーマ変更と初期データ挿入が終わった後に `conn.commit()` を呼び出します (既存の `setup_database` の最後にコミットがあればそれでOK)。
+
+### 2. `traverse_ast` 関数の修正詳細
+
+**2.1. 対象ファイルと主要ロジック**
+* `c_cxx_source_parser/header_parser.py`
+* `c_cxx_source_parser/impl_parser.py`
+* Step 3で計画したスコープスタック管理、FQN生成、DBアクセスヘルパーの呼び出し、各定義要素への `namespace_id` 割り当てを実装します。
+
+**2.2. ヘルパー関数の実装 (各スクリプト内にプライベート関数として、または共通化を視野に)**
+* `_generate_fqn(parent_fqn, current_name_str, is_anonymous, file_path_for_uniqueness, location_for_uniqueness)`
+* `_get_or_create_namespace_db_entry(db_conn, cursor, fqn, name_for_db, parent_db_id, file_id, location_str)` (DBカーソルも引数に取る方が便利)
+* `_get_global_namespace_id(db_conn, cursor)`
+
+**2.3. `main` 関数でのスコープスタック初期化**
+```python
+# In main() of both parsers
+# ...
+conn = setup_database(db_filepath)
+# ...
+file_id_for_this_run = add_file_record(conn, source_filepath)
+
+# グローバルスコープ情報の準備 (DBカーソルを使用)
+db_cursor = conn.cursor()
+global_ns_id = _get_global_namespace_id(conn, db_cursor) # DBから (global) の ID を取得
+initial_scope_stack = [(global_ns_id, "(global)")]
+
+traverse_ast(tu.cursor, conn, db_cursor, file_id_for_this_run, target_filepath_abs, initial_scope_stack) # db_cursor と scope_stack を渡す
+# ...
+conn.commit()
+```
+※ `traverse_ast` がDB操作を行うため、`db_cursor` も引き渡すように変更します。
+
+**2.4. `traverse_ast` 関数のシグネチャ変更と実装**
+旧: `traverse_ast(cursor, db_conn, file_id, target_filepath)`
+新: `traverse_ast(cursor, db_conn, db_cursor, file_id, target_filepath, scope_stack)`
+
+Step 3 (3.1, 3.2) で計画したロジックを実装します。
+
+**2.5. `impl_parser.py` でのクラスメンバーと名前空間の処理**
+* クラス定義 (`STRUCT_DECL`, `CLASS_DECL`) を処理する際:
+    1.  現在のスコープスタックのトップから、このクラスが属する `namespace_id` を取得します。
+    2.  クラス情報を `structs_unions` テーブルに挿入する際、この `namespace_id` も記録します。
+* クラスメンバー関数/変数を処理する際:
+    1.  `semantic_parent` がクラスであることを確認します。
+    2.  そのクラスの `parent_name` (クラス名) を取得します。
+    3.  そのクラスが属する `namespace_id` を取得する必要があります。これは、クラス定義をパースした際に一時的にクラスカーソルと `namespace_id` を紐付けておくか、あるいは `structs_unions` テーブルからクラス名と現在の `file_id` で検索して `namespace_id` を再取得するなどの方法が考えられます。より効率的なのは、`traverse_ast` でクラススコープに入る際に、クラス自身の `namespace_id` もスコープ情報の一部としてスタックに積むか、別の方法で子ノードに伝えることです。
+        * **提案:** スコープスタックの要素を `(db_id, fqn, type_of_scope)` のように拡張し、`type_of_scope` が `'namespace'` か `'class'` かを区別できるようにする。クラスメンバーの場合は、スタックを遡って直近の `'namespace'` スコープの `db_id` を `namespace_id` とし、直近の `'class'` スコープの `db_id` (これは `structs_unions.id`) を `parent_id` のような別の概念で扱う（既存の `parent_name` はクラス名なので、これとクラスが属する`namespace_id`を組み合わせる）。
+        * **簡略化案（初期実装向け）:** クラスメンバーの場合、`parent_name` はクラス名とし、`namespace_id` は現在のスコープスタックのトップにある名前空間IDとする。これは「クラス自体が現在のアクティブな名前空間スコープに直接定義されている」という前提です。ネストしたクラス内のクラスなどはこの簡略化では対応が難しい可能性がありますが、多くのケースをカバーできます。
+            ```python
+            # impl_parser.py の traverse_ast 内の FUNCTION_DECL/VAR_DECL 処理
+            # ...
+            current_ns_id_for_element, _ = scope_stack[-1] # 現在アクティブな名前空間ID
+
+            # ... (name, type, etc. の抽出)
+            db_parent_name = None
+            db_namespace_id = current_ns_id_for_element # デフォルト
+
+            if cursor.semantic_parent.kind in [CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL, CursorKind.UNION_DECL]:
+                # クラス/構造体メンバーの場合
+                db_parent_name = cursor.semantic_parent.spelling
+                # db_namespace_id は変更せず、このクラスが定義されている名前空間のIDをそのまま使用
+            
+            # db_cursor.execute("INSERT INTO functions (..., parent_name, namespace_id) ...",
+            #                   (..., db_parent_name, db_namespace_id))
+            ```
+
+### 3. テストケースの作成詳細
+
+**3.1. テスト用C++ソースファイルのディレクトリ構造**
+`tests/test_targets/namespaces/` ディレクトリを作成し、以下のようなファイルを配置します。
+
+* `global_defs.h`, `global_defs.cpp`
+* `simple_ns.h`, `simple_ns.cpp` (例: `namespace A { ... }`)
+* `nested_ns.h`, `nested_ns.cpp` (例: `namespace B { namespace C { ... } }`)
+* `anonymous_ns.cpp` (ヘッダーにも配置可能だが、通常はcpp内)
+* `split_ns_part1.h`, `split_ns_part2.h`, `split_ns.cpp` (同じ名前空間 `D` を複数のファイルで拡張)
+* `class_in_ns.h`, `class_in_ns.cpp` (例: `namespace E { class MyClass { ... }; }`)
+* `mixed_scopes.cpp` (グローバル、名前空間、クラス、匿名名前空間を混在させた複雑なケース)
+
+**3.2. 各テストファイルの内容例と期待値の設計**
+各ファイルについて、どのような名前空間、関数、変数などが定義され、それらがDB上でどのFQNの `namespaces` レコード (およびそのID) に紐づくべきかをリストアップします。
+
+例: `simple_ns.h`
+```cpp
+// tests/test_targets/namespaces/simple_ns.h
+namespace MySimpleNS {
+    void func_in_simple_ns();
+    int var_in_simple_ns;
+}
+```
+期待値:
+* `namespaces` テーブル:
+    * `(id=X, name="MySimpleNS", parent_namespace_id=ID_OF_GLOBAL, ..., fqn="(global)::MySimpleNS")`
+* `functions` テーブル:
+    * `(name="func_in_simple_ns", namespace_id=X, ...)`
+* `variables` テーブル:
+    * `(name="var_in_simple_ns", namespace_id=X, ...)`
+
+### 4. テストの実行と検証方法詳細
+
+**4.1. テストスクリプトの作成/拡張**
+`tests/test_namespace_parsing.py` のような新しいテストファイルを作成します。
+`pytest` を使用し、`tests/test_parsers_automation.py` のようにパーサー実行とDB検証のヘルパー関数を用意します。
+
+**4.2. テストフィクスチャの準備**
+* テスト実行前にテスト用DBファイルをクリーンアップ。
+* テストターゲットのC++ファイルを指定してパーサー (`header_parser.py` または `impl_parser.py`, あるいは `route_parser.py`) を実行。
+
+**4.3. データベース内容の検証ロジック (Python + sqlite3)**
+* **`namespaces` テーブル検証関数:**
+    * `check_namespace_exists(db_conn, fqn, expected_name, expected_parent_fqn)`
+    * `check_anonymous_namespace_count(db_conn, parent_fqn, expected_count)`
+* **要素テーブル検証関数:**
+    * `check_function_in_namespace(db_conn, func_name, expected_namespace_fqn)`
+    * `check_variable_in_namespace(db_conn, var_name, expected_namespace_fqn)`
+    * `check_class_in_namespace(db_conn, class_name, expected_namespace_fqn)`
+    * `check_class_member_function(db_conn, class_name, method_name, expected_class_namespace_fqn)` (impl_parser用)
+
+**4.4. 各テストケースの実装**
+上記3.1で作成した各C++テストファイルセットに対して、パーサーを実行し、4.3の検証関数を用いて期待通りのデータが格納されているかをアサートします。
+
+例:
+```python
+# tests/test_namespace_parsing.py
+def test_simple_namespace_parsing(run_parser_on_file, db_connection): # pytest fixtures
+    db_file = run_parser_on_file("namespaces/simple_ns.h", parser_type="header")
+    conn = db_connection(db_file)
+    
+    assert check_namespace_exists(conn, "(global)::MySimpleNS", "MySimpleNS", "(global)")
+    assert check_function_in_namespace(conn, "func_in_simple_ns", "(global)::MySimpleNS")
+    assert check_variable_in_namespace(conn, "var_in_simple_ns", "(global)::MySimpleNS")
+```
+
+### 5. 段階的な実装とテスト
+
+1.  **`setup_database` の変更と基本テスト:**
+    * スキーマ変更を実装し、手動でDBファイルを作成してスキーマを確認。
+    * グローバル名前空間レコードが正しく挿入されることをテスト。
+2.  **グローバルスコープ要素の `namespace_id` 割り当て:**
+    * `traverse_ast` の変更（スタック導入とグローバルID割り当てのみ）。
+    * `global_defs.h/.cpp` でテスト。
+3.  **単純な名前空間の処理:**
+    * `CursorKind.NAMESPACE` の基本処理（FQN生成、DB登録、スタック操作）を実装。
+    * `simple_ns.h/.cpp` でテスト。
+4.  **ネストした名前空間の処理:**
+    * FQN生成とスタック操作がネストに対応していることを確認。
+    * `nested_ns.h/.cpp` でテスト。
+5.  **匿名名前空間の処理:**
+    * 匿名判定、FQNの一意性生成ロジックを実装。
+    * `anonymous_ns.cpp` でテスト。
+6.  **分割定義の処理:**
+    * `get_or_create_namespace_db_entry` がFQNに基づいて既存エントリを正しく引けることを確認。
+    * `split_ns_*.h/.cpp` でテスト。
+7.  **クラスと名前空間の組み合わせ (`impl_parser.py`):**
+    * 名前空間内のクラス、そのメンバーの `namespace_id` と `parent_name` が正しく記録されることを確認。
+    * `class_in_ns.h/.cpp` でテスト。
+8.  **全機能統合テスト:**
+    * `mixed_scopes.cpp` で複雑なケースをテスト。
+
+---
+
+この計画に従い、各コンポーネントを慎重に実装し、それぞれの段階でテストを行うことで、堅牢な名前空間解析機能を実現できるはずです。

@@ -18,7 +18,7 @@ def setup_database(db_path):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # ファイル管理テーブル (ヘッダと同じ)
+    # ファイル管理テーブル
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,8 +26,41 @@ def setup_database(db_path):
             last_parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # グローバルコンテキスト用のダミーファイルレコードを挿入
+    global_context_filepath = '(global_context)'
+    cursor.execute("INSERT OR IGNORE INTO files (filepath) VALUES (?)", (global_context_filepath,))
+    cursor.execute("SELECT id FROM files WHERE filepath = ?", (global_context_filepath,))
+    global_file_id_record = cursor.fetchone()
+    if not global_file_id_record:
+        raise Exception("Failed to insert or find global_context file record.")
+    global_file_id_for_global_ns = global_file_id_record[0]
 
-    # マクロ定義テーブル (ヘッダと同じ - .c/.cpp内で定義されるマクロ用)
+    # 名前空間テーブル (新規追加)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS namespaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_namespace_id INTEGER,
+            file_id INTEGER NOT NULL,
+            location TEXT NOT NULL,
+            full_qualified_name TEXT NOT NULL UNIQUE,
+            FOREIGN KEY (parent_namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_name ON namespaces (name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_parent_id ON namespaces (parent_namespace_id)')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_namespaces_fqn ON namespaces (full_qualified_name)')
+    
+    # グローバル名前空間レコードを挿入
+    global_namespace_name = "(global)"
+    global_namespace_fqn = "(global)"
+    cursor.execute("""
+        INSERT OR IGNORE INTO namespaces (name, parent_namespace_id, file_id, location, full_qualified_name)
+        VALUES (?, NULL, ?, ?, ?)
+    """, (global_namespace_name, global_file_id_for_global_ns, "N/A", global_namespace_fqn))
+
+    # マクロ定義テーブル (変更なし)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS macros (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,100 +73,104 @@ def setup_database(db_path):
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_macro_name ON macros (name)')
 
-    # 関数定義/宣言テーブル (拡張)
+    # 関数定義/宣言テーブル (namespace_id 追加, 拡張カラムは維持)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS functions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             return_type TEXT,
             parameters TEXT,
-            is_declaration INTEGER NOT NULL, -- 0: 定義(本体あり), 1: 宣言(プロトタイプ)
-            is_static INTEGER DEFAULT 0,     -- 1: static関数, 0: その他
-            parent_kind TEXT,                -- C++用: 親カーソルの種類 (例: CLASS_DECL)
-            parent_name TEXT,                -- C++用: 親クラス/構造体名
+            is_declaration INTEGER NOT NULL,
+            is_static INTEGER DEFAULT 0,
+            parent_kind TEXT,
+            parent_name TEXT,
             location TEXT,
-            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_func_name ON functions (name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_func_parent ON functions (parent_name)')
 
-
-    # 構造体/共用体定義テーブル (ヘッダと同じ - .c/.cpp内で定義される場合用)
+    # 構造体/共用体定義テーブル (namespace_id 追加)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS structs_unions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
-            kind TEXT NOT NULL, -- 'struct' or 'union'
+            namespace_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
             name TEXT,
             members TEXT,
             location TEXT,
-            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_struct_name ON structs_unions (name)')
 
-
-    # 列挙型定義テーブル (ヘッダと同じ - .c/.cpp内で定義される場合用)
+    # 列挙型定義テーブル (namespace_id 追加)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS enums (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
             name TEXT,
             constants TEXT,
             location TEXT,
-            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_enum_name ON enums (name)')
 
-
-    # Typedef定義テーブル (ヘッダと同じ - .c/.cpp内で定義される場合用)
+    # Typedef定義テーブル (namespace_id 追加)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS typedefs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             underlying_type TEXT,
             location TEXT,
-            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_typedef_name ON typedefs (name)')
 
-
-    # グローバル/静的変数 定義/宣言テーブル (拡張)
+    # グローバル/静的変数 定義/宣言テーブル (namespace_id 追加, 拡張カラムは維持)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS variables (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             type TEXT,
-            is_extern INTEGER DEFAULT 0,     -- 1: extern宣言, 0: その他(定義の可能性)
-            is_static INTEGER DEFAULT 0,     -- 1: static変数, 0: その他
-            has_initializer INTEGER DEFAULT 0, -- 1: 初期化子を持つ, 0: 持たない (簡易チェック)
+            is_extern INTEGER DEFAULT 0,
+            is_static INTEGER DEFAULT 0,
+            has_initializer INTEGER DEFAULT 0,
             location TEXT,
-            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_var_name ON variables (name)')
 
-
     conn.commit()
     return conn
 
-# ヘッダ解析と同じ関数 (変更なし)
 def clear_definitions_for_file(conn, file_id):
+    """特定のファイルIDに関連する定義をDBから削除する"""
     cursor = conn.cursor()
-    # 注意: テーブル名は更新されたスキーマに合わせてください
     tables = ['macros', 'functions', 'structs_unions', 'enums', 'typedefs', 'variables']
     for table in tables:
         cursor.execute(f"DELETE FROM {table} WHERE file_id = ?", (file_id,))
     conn.commit()
 
-# ヘッダ解析と同じ関数 (変更なし)
 def add_file_record(conn, filepath):
+    """ファイルをDBに記録し、既存の場合は更新、新規の場合は挿入してIDを返す"""
     cursor = conn.cursor()
     filepath_abs = os.path.abspath(filepath)
     now = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -151,7 +188,41 @@ def add_file_record(conn, filepath):
     conn.commit()
     return file_id
 
-# ヘッダ解析と同じ関数 (変更なし)
+# --- 新しいヘルパー関数 ---
+def _get_global_namespace_id(db_cursor):
+    """グローバル名前空間のIDを取得する"""
+    db_cursor.execute("SELECT id FROM namespaces WHERE full_qualified_name = ?", ("(global)",))
+    result = db_cursor.fetchone()
+    if not result:
+        raise Exception("Global namespace not found in the database. setup_database might have failed.")
+    return result[0]
+
+def _generate_fqn(parent_fqn, current_name_str, is_anonymous, file_path, location):
+    """完全修飾名を生成する"""
+    if is_anonymous:
+        unique_suffix = f"{os.path.basename(file_path)}_{location.line}_{location.column}"
+        name_part = f"(anonymous)_{unique_suffix}"
+    else:
+        name_part = current_name_str
+    
+    if parent_fqn == "(global)":
+        return f"(global)::{name_part}"
+    return f"{parent_fqn}::{name_part}"
+
+def _get_or_create_namespace_db_entry(db_conn, db_cursor, fqn, name_for_db, parent_db_id, file_id, location_str):
+    """FQNに基づいてDBからnamespaceエントリを取得または作成する"""
+    db_cursor.execute("SELECT id FROM namespaces WHERE full_qualified_name = ?", (fqn,))
+    row = db_cursor.fetchone()
+    if row:
+        return row[0]
+    else:
+        db_cursor.execute(
+            "INSERT INTO namespaces (name, parent_namespace_id, file_id, location, full_qualified_name) VALUES (?, ?, ?, ?, ?)",
+            (name_for_db, parent_db_id, file_id, location_str, fqn)
+        )
+        return db_cursor.lastrowid
+
+# --- Clang AST 解析 (既存ヘルパー) ---
 def get_macro_body(cursor):
     tokens = list(cursor.get_tokens())
     if len(tokens) > 1:
@@ -165,35 +236,23 @@ def get_macro_body(cursor):
         return body.strip()
     return None
 
-# ヘッダ解析と同じ関数 (変更なし)
 def get_function_params(cursor):
     params = []
-    # get_arguments() は宣言に対して有効。定義の場合は型情報を辿る必要がある場合も。
-    # libclangがうまく取れない場合、cursor.type.argument_types() なども試せるが複雑化する。
-    # ここでは get_arguments() がうまく機能することを期待する。
     try:
         for arg in cursor.get_arguments():
-             # 引数名がない場合もある (例: void func(int);)
             param_name = arg.spelling or ""
             param_type = arg.type.spelling
             params.append(f"{param_type} {param_name}".strip())
-    except Exception as e:
-        print(f"Warning: Could not get arguments for {cursor.spelling}: {e}", file=sys.stderr)
-        # 型情報からパラメータを取得するフォールバック (より複雑)
+    except Exception:
         try:
              func_type = cursor.type
-             if func_type.kind == TypeKind.FUNCTIONPROTO or func_type.kind == TypeKind.FUNCTIONNOPROTO:
-                 arg_types = func_type.argument_types()
-                 for i, arg_type in enumerate(arg_types):
-                     params.append(f"{arg_type.spelling} arg{i+1}") # 仮の引数名
-        except Exception as e2:
-             print(f"Warning: Could not get argument types for {cursor.spelling}: {e2}", file=sys.stderr)
-             return "..." # 取得失敗を示す
-
+             if func_type.kind in (TypeKind.FUNCTIONPROTO, TypeKind.FUNCTIONNOPROTO):
+                 for i, arg_type in enumerate(func_type.argument_types()):
+                     params.append(f"{arg_type.spelling} arg{i+1}")
+        except Exception:
+             return "..."
     return ", ".join(params)
 
-
-# ヘッダ解析と同じ関数 (変更なし)
 def get_struct_union_members(cursor):
     members = []
     for child in cursor.get_children():
@@ -201,7 +260,6 @@ def get_struct_union_members(cursor):
             members.append(f"{child.type.spelling} {child.spelling};")
     return " ".join(members)
 
-# ヘッダ解析と同じ関数 (変更なし)
 def get_enum_constants(cursor):
     constants = []
     for child in cursor.get_children():
@@ -213,70 +271,69 @@ def get_enum_constants(cursor):
 
 def has_initializer(cursor):
     """変数が初期化子を持つか簡易的にチェック"""
-    # VAR_DECL の子は型(TYPE_REFなど)と初期化式(INTEGER_LITERAL, CALL_EXPRなど)になる
     for child in cursor.get_children():
-        # 代表的な初期化式の種類をチェック (網羅的ではない可能性あり)
-        if child.kind in [
-            CursorKind.INTEGER_LITERAL, CursorKind.FLOATING_LITERAL,
-            CursorKind.IMAGINARY_LITERAL, CursorKind.STRING_LITERAL,
-            CursorKind.CHARACTER_LITERAL, CursorKind.CXX_BOOL_LITERAL_EXPR,
-            CursorKind.CXX_NULL_PTR_LITERAL_EXPR, CursorKind.GNU_NULL_EXPR,
-            CursorKind.UNEXPOSED_EXPR, # 初期化式が複雑な場合これになることも
-            CursorKind.CALL_EXPR, CursorKind.INIT_LIST_EXPR,
-            CursorKind.PAREN_EXPR, CursorKind.UNARY_OPERATOR,
-            CursorKind.BINARY_OPERATOR,
-            CursorKind.CONDITIONAL_OPERATOR, CursorKind.CSTYLE_CAST_EXPR,
-            CursorKind.CXX_STATIC_CAST_EXPR, CursorKind.CXX_DYNAMIC_CAST_EXPR,
-            CursorKind.CXX_REINTERPRET_CAST_EXPR, CursorKind.CXX_CONST_CAST_EXPR,
-            CursorKind.CXX_FUNCTIONAL_CAST_EXPR, CursorKind.CXX_NEW_EXPR,
-            CursorKind.CXX_DELETE_EXPR, CursorKind.CXX_THIS_EXPR,
-            CursorKind.ADDR_LABEL_EXPR, CursorKind.StmtExpr, # GCC拡張
-            CursorKind.COMPOUND_LITERAL_EXPR # C99複合リテラル
-        ]:
+        if child.kind.is_expression() or child.kind == CursorKind.INIT_LIST_EXPR:
             return 1
     return 0
 
+# --- traverse_ast (大幅に修正) ---
 
-# --- Clang AST Analysis (updated for implementation files) ---
-
-def traverse_ast(cursor, db_conn, file_id, target_filepath):
+def traverse_ast(
+        cursor: clang.cindex.Cursor,
+        db_conn: sqlite3.Connection,
+        db_cursor: sqlite3.Cursor,
+        file_id: int,
+        target_filepath: str,
+        scope_stack: list
+) -> None:
     """Recursively traverse the AST and add definitions to the database"""
-    db_cursor = db_conn.cursor()
 
-    # Determine if the cursor is in the target file or a related header
+    # Check if the cursor is in the target file (exclude included headers)
     in_target_file = False
     if cursor.location and cursor.location.file:
         try:
             in_target_file = os.path.abspath(cursor.location.file.name) == target_filepath
         except FileNotFoundError:
-            # Can error out for temporary files, etc.
             pass
     
-    # Get scope (file scope, class/struct scope, etc.)
-    parent_kind = None
-    parent_name = None
-    is_file_scope = False
-    is_class_scope = False # For C++
+    # We only care about definitions within the target file.
+    if not in_target_file:
+        return
 
-    try:
-        semantic_parent = cursor.semantic_parent
-        if semantic_parent:
-            parent_kind_enum = semantic_parent.kind
-            parent_kind = parent_kind_enum.name # Store as string
-            is_file_scope = parent_kind_enum == CursorKind.TRANSLATION_UNIT
-            is_class_scope = parent_kind_enum in [CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL, CursorKind.NAMESPACE] # C++
-            if is_class_scope and semantic_parent.spelling:
-                 parent_name = semantic_parent.spelling
-    except Exception as e:
-        # print(f"Debug: Could not get semantic parent for {cursor.kind} {cursor.spelling}: {e}", file=sys.stderr)
-        pass # Sometimes parent can't be retrieved
+    current_ns_id, parent_fqn = scope_stack[-1]
 
+    # --- Process various definitions ---
 
+    if cursor.kind == CursorKind.NAMESPACE:
+        name_str = cursor.spelling
+        is_anonymous = not name_str
+        location_str = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}" if cursor.location else "unknown"
+        
+        fqn = _generate_fqn(parent_fqn, name_str, is_anonymous, target_filepath, cursor.location)
+        db_name = "(anonymous)" if is_anonymous else name_str
+
+        new_ns_id = _get_or_create_namespace_db_entry(db_conn, db_cursor, fqn, db_name, current_ns_id, file_id, location_str)
+
+        scope_stack.append((new_ns_id, fqn))
+        for child in cursor.get_children():
+            traverse_ast(child, db_conn, db_cursor, file_id, target_filepath, scope_stack)
+        scope_stack.pop()
+        return
+
+    # Determine scope (file scope, class/struct scope, etc.)
+    parent_kind, parent_name = None, None
+    is_file_scope, is_class_scope = False, False
+    semantic_parent = cursor.semantic_parent
+    if semantic_parent:
+        is_file_scope = semantic_parent.kind == CursorKind.TRANSLATION_UNIT or semantic_parent.kind == CursorKind.NAMESPACE
+        is_class_scope = semantic_parent.kind in [CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL, CursorKind.NAMESPACE]
+        parent_kind = semantic_parent.kind.name
+        if is_class_scope:
+            parent_name = semantic_parent.spelling
+    
     # --- Handle definitions (mainly file scope or class scope) ---
-
-    # Macro (defined in the file)
-    # Check cursor.location to determine file
-    if cursor.kind == CursorKind.MACRO_DEFINITION and in_target_file:
+    # マクロは名前空間に属さないので、従来通りの処理
+    if cursor.kind == CursorKind.MACRO_DEFINITION:
         name = cursor.spelling
         body = get_macro_body(cursor)
         location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
@@ -284,224 +341,143 @@ def traverse_ast(cursor, db_conn, file_id, target_filepath):
             db_cursor.execute("INSERT INTO macros (file_id, name, body, location) VALUES (?, ?, ?, ?)",
                               (file_id, name, body, location))
 
-    # Function (file scope or class scope)
     elif cursor.kind == CursorKind.FUNCTION_DECL and (is_file_scope or is_class_scope):
-         # In .cpp files, functions may be declared in headers and defined in .cpp files, appearing in both.
-         # Use in_target_file to focus on definitions/declarations in the current file.
-        if in_target_file:
-            name = cursor.spelling
-            if not name: # Skip unnamed functions
-                return
+        name = cursor.spelling
+        if not name: return
 
-            return_type = cursor.result_type.spelling
-            params = get_function_params(cursor)
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            is_definition = cursor.is_definition() # Has body (is a definition)
-            storage_class = cursor.storage_class
-            is_static = storage_class == StorageClass.STATIC
+        return_type = cursor.result_type.spelling
+        params = get_function_params(cursor)
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
+        is_definition = cursor.is_definition()
+        is_static = cursor.storage_class == StorageClass.STATIC
 
-            # C++ constructors/destructors may not have a return type
-            if not return_type and parent_kind in ['CLASS_DECL', 'STRUCT_DECL']:
-                 if name == parent_name: # Constructor
-                     return_type = "(constructor)"
-                 elif name == f"~{parent_name}": # Destructor
-                     return_type = "(destructor)"
+        if not return_type and parent_kind in ['CLASS_DECL', 'STRUCT_DECL']:
+             if name == parent_name: return_type = "(constructor)"
+             elif name == f"~{parent_name}": return_type = "(destructor)"
 
-            # print(f" Found Function: {name} (static={is_static}, def={is_definition}) in {parent_kind}:{parent_name} at {location}")
-            db_cursor.execute(
-                "INSERT INTO functions (file_id, name, return_type, parameters, is_declaration, is_static, parent_kind, parent_name, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (file_id, name, return_type, params, 0 if is_definition else 1, 1 if is_static else 0, parent_kind if is_class_scope else None, parent_name if is_class_scope else None, location)
-            )
+        db_cursor.execute(
+            "INSERT INTO functions (file_id, namespace_id, name, return_type, parameters, is_declaration, is_static, parent_kind, parent_name, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_id, current_ns_id, name, return_type, params, 0 if is_definition else 1, 1 if is_static else 0, parent_kind if is_class_scope else None, parent_name if is_class_scope else None, location)
+        )
 
-    # Global variables / file static variables (file scope only)
     elif cursor.kind == CursorKind.VAR_DECL and is_file_scope:
-        if in_target_file:
-            name = cursor.spelling
-            if not name: # Skip unnamed variables
-                return
+        name = cursor.spelling
+        if not name: return
 
-            var_type = cursor.type.spelling
-            storage_class = cursor.storage_class
-            is_extern = storage_class == StorageClass.EXTERN
-            is_static = storage_class == StorageClass.STATIC
-            init = has_initializer(cursor)
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
+        var_type = cursor.type.spelling
+        is_extern = cursor.storage_class == StorageClass.EXTERN
+        is_static = cursor.storage_class == StorageClass.STATIC
+        init = has_initializer(cursor)
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
 
-            # print(f" Found Variable: {name} (static={is_static}, extern={is_extern}, init={init}) at {location}")
-            db_cursor.execute(
-                "INSERT INTO variables (file_id, name, type, is_extern, is_static, has_initializer, location) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (file_id, name, var_type, 1 if is_extern else 0, 1 if is_static else 0, init, location)
-            )
+        db_cursor.execute(
+            "INSERT INTO variables (file_id, namespace_id, name, type, is_extern, is_static, has_initializer, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_id, current_ns_id, name, var_type, 1 if is_extern else 0, 1 if is_static else 0, init, location)
+        )
 
-    # Structs/unions (file scope) - usually defined in headers, but also possible in .c/.cpp files
-    elif cursor.kind == CursorKind.STRUCT_DECL and is_file_scope:
-        if in_target_file and cursor.is_definition(): # Record only definitions
-            name = cursor.spelling or None
-            kind = 'struct'
-            members = get_struct_union_members(cursor)
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
-                              (file_id, kind, name, members, location))
+    elif cursor.kind in [CursorKind.STRUCT_DECL, CursorKind.UNION_DECL] and is_file_scope and cursor.is_definition():
+        kind = 'struct' if cursor.kind == CursorKind.STRUCT_DECL else 'union'
+        name = cursor.spelling or None
+        members = get_struct_union_members(cursor)
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
+        db_cursor.execute("INSERT INTO structs_unions (file_id, namespace_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?, ?)",
+                          (file_id, current_ns_id, kind, name, members, location))
 
-    elif cursor.kind == CursorKind.UNION_DECL and is_file_scope:
-        if in_target_file and cursor.is_definition():
-            name = cursor.spelling or None
-            kind = 'union'
-            members = get_struct_union_members(cursor)
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            db_cursor.execute("INSERT INTO structs_unions (file_id, kind, name, members, location) VALUES (?, ?, ?, ?, ?)",
-                              (file_id, kind, name, members, location))
+    elif cursor.kind == CursorKind.ENUM_DECL and is_file_scope and cursor.is_definition():
+        name = cursor.spelling or None
+        constants = get_enum_constants(cursor)
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
+        db_cursor.execute("INSERT INTO enums (file_id, namespace_id, name, constants, location) VALUES (?, ?, ?, ?, ?)",
+                          (file_id, current_ns_id, name, constants, location))
 
-    # Enums (file scope)
-    elif cursor.kind == CursorKind.ENUM_DECL and is_file_scope:
-        if in_target_file and cursor.is_definition():
-            name = cursor.spelling or None
-            constants = get_enum_constants(cursor)
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            db_cursor.execute("INSERT INTO enums (file_id, name, constants, location) VALUES (?, ?, ?, ?)",
-                              (file_id, name, constants, location))
-
-    # Typedefs (file scope)
     elif cursor.kind == CursorKind.TYPEDEF_DECL and is_file_scope:
-        if in_target_file:
-            name = cursor.spelling
-            try:
-                 underlying_type = cursor.underlying_typedef_type.spelling
-            except Exception:
-                 underlying_type = "unknown" # Handle cases where underlying type can't be retrieved
-            location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
-            db_cursor.execute("INSERT INTO typedefs (file_id, name, underlying_type, location) VALUES (?, ?, ?, ?)",
-                              (file_id, name, underlying_type, location))
+        name = cursor.spelling
+        underlying_type = cursor.underlying_typedef_type.spelling
+        location = f"{os.path.basename(cursor.location.file.name)}:{cursor.location.line}:{cursor.location.column}"
+        db_cursor.execute("INSERT INTO typedefs (file_id, namespace_id, name, underlying_type, location) VALUES (?, ?, ?, ?, ?)",
+                          (file_id, current_ns_id, name, underlying_type, location))
 
-
-    # --- Recursively traverse child nodes ---
-    # By default, do not traverse inside functions or classes (focus on file/class scope definitions)
-    # However, for namespaces and similar, further traversal may be needed.
-    # Here, we simply traverse all top-level child nodes.
-    # (Local variables inside functions, etc., are excluded by the is_file_scope/is_class_scope checks above)
-    for child in cursor.get_children():
-        traverse_ast(child, db_conn, file_id, target_filepath)
-
+    # --- Recursively explore child nodes ---
+    if cursor.kind != CursorKind.NAMESPACE:
+        for child in cursor.get_children():
+            traverse_ast(child, db_conn, db_cursor, file_id, target_filepath, scope_stack)
 
 # --- メイン処理 ---
 def main():
     parser = argparse.ArgumentParser(description='Parse C/C++ implementation file (.c, .cpp) and store definitions in SQLite.')
     parser.add_argument('source_file', help='Path to the C/C++ source file to parse.')
-    # デフォルトDB名を変更
     parser.add_argument('-db', '--database', default='implementations.db', help='Path to the SQLite database file (default: implementations.db).')
-    parser.add_argument('-I', '--include', action='append', default=[], help='Add directory to include search path (crucial for resolving types).')
-    parser.add_argument('-D', '--define', action='append', default=[], help='Define a macro (e.g., -DNDEBUG).')
+    parser.add_argument('-I', '--include', action='append', default=[], help='Add directory to include search path.')
+    parser.add_argument('-D', '--define', action='append', default=[], help='Define a macro.')
     parser.add_argument('--libclang', help=f'Path to libclang library file (e.g., {LIBCLANG_PATH or "/path/to/libclang.so"})')
-    parser.add_argument('--lang', choices=['c', 'c++'], default=None, help='Force language standard (e.g., c++11). Tries to guess from extension if not provided.')
-    parser.add_argument('--std', default=None, help='Set C/C++ standard (e.g., c11, c++17).')
-
+    parser.add_argument('--lang', choices=['c', 'c++'], default=None, help='Force language.')
+    parser.add_argument('--std', default=None, help='Set C/C++ standard.')
 
     args = parser.parse_args()
 
     source_filepath = args.source_file
     db_filepath = args.database
-    clang_args = []
+    clang_args = [f'-I{d}' for d in args.include] + [f'-D{m}' for m in args.define]
 
-    # インクルードパス (実装ファイル解析では特に重要)
-    for include_dir in args.include:
-        clang_args.append(f'-I{include_dir}')
-
-    # マクロ定義
-    for define_macro in args.define:
-        clang_args.append(f'-D{define_macro}')
-
-    # 言語と標準
     language = args.lang
     if not language:
         if source_filepath.endswith(('.cpp', '.cxx', '.cc', '.C')):
             language = 'c++'
         else:
-            language = 'c' # デフォルト C
+            language = 'c'
 
     if language == 'c++':
-        clang_args.append('-x')
-        clang_args.append('c++')
-        std_arg = args.std or 'c++11' # デフォルト C++11
+        clang_args.extend(['-x', 'c++'])
+        std_arg = args.std or 'c++11'
         clang_args.append(f'-std={std_arg}')
     else:
-        clang_args.append('-x')
-        clang_args.append('c')
-        if args.std:
-            clang_args.append(f'-std={args.std}')
-
+        clang_args.extend(['-x', 'c'])
+        if args.std: clang_args.append(f'-std={args.std}')
 
     print(f"Parsing: {source_filepath}")
     print(f"Database: {db_filepath}")
     print(f"Clang Args: {' '.join(clang_args)}")
 
-    # libclangのパス設定
-    libclang_path_to_use = args.libclang or LIBCLANG_PATH
-    if libclang_path_to_use:
-        if os.path.exists(libclang_path_to_use):
-            Config.set_library_file(libclang_path_to_use)
-            print(f"Using libclang: {libclang_path_to_use}")
-        else:
-            print(f"Warning: Specified libclang path not found: {libclang_path_to_use}", file=sys.stderr)
-            print("Attempting to find libclang automatically...", file=sys.stderr)
+    if args.libclang and os.path.exists(args.libclang):
+        Config.set_library_file(args.libclang)
+        print(f"Using libclang: {args.libclang}")
+    elif LIBCLANG_PATH and os.path.exists(LIBCLANG_PATH):
+        Config.set_library_file(LIBCLANG_PATH)
+        print(f"Using libclang from LIBCLANG_PATH: {LIBCLANG_PATH}")
     else:
-         print("Attempting to find libclang automatically...")
+        print("Attempting to find libclang automatically...")
 
     try:
-        # Clangインデックス作成
         index = Index.create()
+        # 実装ファイルなので PARSE_SKIP_FUNCTION_BODIES は使用しない
+        tu = index.parse(source_filepath, args=clang_args, options=0)
 
-        # 実装ファイルをパース
-        # PARSE_SKIP_FUNCTION_BODIES を *削除* して is_definition() の精度を上げる
-        # (本体の内容自体はDBに保存しないが、定義かどうかの判定に使う)
-        parse_options = 0
-        print("Parsing source file (this may take a moment)...")
-        tu = index.parse(
-            source_filepath,
-            args=clang_args,
-            options=parse_options
-        )
-
-        # パースエラーチェック
-        has_errors = False
-        for diag in tu.diagnostics:
-             # Warning 以上を表示 (Info, Ignored は除外)
-            if diag.severity >= diag.Warning:
-                severity_str = {
-                    diag.Ignored: "Ignored", diag.Note: "Note", diag.Warning: "Warning",
-                    diag.Error: "Error", diag.Fatal: "Fatal"
-                }.get(diag.severity, "Unknown")
-                loc = diag.location
-                loc_str = f"{loc.file}:{loc.line}:{loc.column}" if loc and loc.file else "(no location)"
-                print(f"Parse {severity_str}: {diag.spelling} at {loc_str}", file=sys.stderr)
-                if diag.severity >= diag.Error:
-                    has_errors = True
-
-        if has_errors:
+        if any(d.severity >= d.Error for d in tu.diagnostics):
             print("Errors occurred during parsing. Results might be incomplete.", file=sys.stderr)
-            # エラーがあっても続行する
+            for diag in tu.diagnostics:
+                if diag.severity >= diag.Warning:
+                    print(f"  {diag.severity.name}: {diag.spelling} at {diag.location}", file=sys.stderr)
 
-        # データベース接続とセットアップ
         conn = setup_database(db_filepath)
+        db_cursor = conn.cursor()
 
-        # ファイルレコードを追加/更新し、ファイルIDを取得
         target_filepath_abs = os.path.abspath(source_filepath)
         file_id = add_file_record(conn, source_filepath)
 
-        # ASTを走査して定義をDBに追加
-        print("Traversing AST and storing definitions...")
-        traverse_ast(tu.cursor, conn, file_id, target_filepath_abs)
+        # スコープスタックの初期化
+        global_ns_id = _get_global_namespace_id(db_cursor)
+        initial_scope_stack = [(global_ns_id, "(global)")]
 
-        # データベースへの変更をコミット
+        print("Traversing AST and storing definitions...")
+        traverse_ast(tu.cursor, conn, db_cursor, file_id, target_filepath_abs, initial_scope_stack)
+
         conn.commit()
         print("Committing changes to database.")
-
-        # 接続を閉じる
         conn.close()
         print("Done.")
 
     except ImportError:
-        print("Error: libclang Python bindings not found.", file=sys.stderr)
-        print("Please install with: pip install clang", file=sys.stderr)
+        print("Error: libclang Python bindings not found. Please install with: pip install clang", file=sys.stderr)
         sys.exit(1)
     except FileNotFoundError:
          print(f"Error: Source file not found: {source_filepath}", file=sys.stderr)
@@ -511,14 +487,12 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
-        if 'library file' in str(e) or 'libclang' in str(e):
-             print("Error: Failed to find or load libclang library.", file=sys.stderr)
-             print("Please ensure LLVM/Clang is installed and accessible.", file=sys.stderr)
+        if 'library file' in str(e):
+             print("Error: Failed to find or load libclang library. Please ensure LLVM/Clang is installed and accessible.", file=sys.stderr)
              print("You might need to set the LIBCLANG_PATH variable in the script or use the --libclang argument.", file=sys.stderr)
         import traceback
-        traceback.print_exc() # 詳細なスタックトレースを表示
+        traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
