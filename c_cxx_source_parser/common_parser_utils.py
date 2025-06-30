@@ -3,19 +3,11 @@ import sqlite3
 import time
 from clang.cindex import CursorKind
 import clang.cindex
+from dataclasses import dataclass
 
-'''
-- add_file_record(conn, filepath)
-- clear_definitions_for_file(conn, file_id)
-- _get_global_namespace_id(db_cursor)
-- _generate_fqn(...)
-- _get_or_create_namespace_db_entry(...)
-- get_macro_body(cursor)
-- get_function_params(cursor)
-- get_struct_union_members(cursor)
-- get_enum_constants(cursor)
-- has_initializer(cursor) (impl_parser.py のみだが汎用的なので移動)
-'''
+@dataclass
+class ParserContext:
+    parser_type: str  # 'header' or 'impl'
 
 def add_file_record(conn, filepath):
     """ファイルをDBに記録し、既存の場合は更新、新規の場合は挿入してIDを返す"""
@@ -102,13 +94,21 @@ def get_macro_body(cursor:clang.cindex.Cursor):
         return body.strip()
     return None # 本体がないか、取得失敗
 
-def get_function_params(cursor:clang.cindex.Cursor):
-    """関数のパラメータリストを文字列として取得する"""
+def get_function_params(cursor):
     params = []
-    for arg in cursor.get_arguments():
-        param_type = arg.type.spelling
-        param_name = arg.spelling
-        params.append(f"{param_type} {param_name}".strip())
+    try:
+        for arg in cursor.get_arguments():
+            param_name = arg.spelling or ""
+            param_type = arg.type.spelling
+            params.append(f"{param_type} {param_name}".strip())
+    except Exception:
+        try:
+             func_type = cursor.type
+             if func_type.kind in (TypeKind.FUNCTIONPROTO, TypeKind.FUNCTIONNOPROTO):
+                 for i, arg_type in enumerate(func_type.argument_types()):
+                     params.append(f"{arg_type.spelling} arg{i+1}")
+        except Exception:
+             return "..."
     return ", ".join(params)
 
 def get_struct_union_members(cursor:clang.cindex.Cursor):
@@ -129,4 +129,130 @@ def get_enum_constants(cursor:clang.cindex.Cursor):
             const_val = child.enum_value
             constants.append(f"{const_name}={const_val}")
     return ", ".join(constants)
+
+def has_initializer(cursor):
+    """変数が初期化子を持つか簡易的にチェック"""
+    for child in cursor.get_children():
+        if child.kind.is_expression() or child.kind == CursorKind.INIT_LIST_EXPR:
+            return 1
+    return 0
+
+def setup_common_tables(conn: sqlite3.Connection):
+    """
+    全てのパーサーで共通のデータベーステーブルと初期レコードをセットアップする。
+    - files テーブル
+    - namespaces テーブル
+    - macros テーブル
+    - structs_unions テーブル
+    - enums テーブル
+    - typedefs テーブル
+    """
+    cursor = conn.cursor()
+
+    # 1. ファイル管理テーブルを作成
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT UNIQUE NOT NULL,
+            last_parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # 2. グローバルコンテキスト用のダミーファイルレコードを挿入し、そのIDを取得
+    #    これは、特定のファイルに依存しない (global) 名前空間の file_id として使用する。
+    global_context_filepath = '(global_context)'
+    cursor.execute("INSERT OR IGNORE INTO files (filepath) VALUES (?)", (global_context_filepath,))
+    cursor.execute("SELECT id FROM files WHERE filepath = ?", (global_context_filepath,))
+    global_file_id_record = cursor.fetchone()
+    if not global_file_id_record:
+        # 通常、上記のINSERT OR IGNOREでレコードは保証されるはず
+        raise Exception("Fatal: Failed to insert or find the '(global_context)' record in the files table.")
+    global_file_id = global_file_id_record[0]
+
+    # 3. 名前空間テーブルを作成
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS namespaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_namespace_id INTEGER,
+            file_id INTEGER NOT NULL,
+            location TEXT NOT NULL,
+            full_qualified_name TEXT NOT NULL UNIQUE,
+            FOREIGN KEY (parent_namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_name ON namespaces (name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_namespaces_parent_id ON namespaces (parent_namespace_id)')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_namespaces_fqn ON namespaces (full_qualified_name)')
+
+    # 4. グローバル名前空間の初期レコードを挿入
+    cursor.execute("""
+        INSERT OR IGNORE INTO namespaces (name, parent_namespace_id, file_id, location, full_qualified_name)
+        VALUES (?, NULL, ?, ?, ?)
+    """, ("(global)", global_file_id, "N/A", "(global)"))
+
+    # 5. 共通の定義テーブルを作成 (すべて namespace_id を含む)
+
+    # マクロ定義テーブル (namespace_id は不要)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS macros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            body TEXT,
+            location TEXT,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_macro_name ON macros (name)')
+
+    # 構造体/共用体定義テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS structs_unions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, 
+            name TEXT,
+            members TEXT,
+            location TEXT,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_struct_name ON structs_unions (name)')
+
+    # 列挙型定義テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS enums (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
+            name TEXT,
+            constants TEXT,
+            location TEXT,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_enum_name ON enums (name)')
+
+    # Typedef定義テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS typedefs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            namespace_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            underlying_type TEXT,
+            location TEXT,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+            FOREIGN KEY (namespace_id) REFERENCES namespaces (id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_typedef_name ON typedefs (name)')
+
+    # 6. データベースへの変更をコミット
+    conn.commit()
 
